@@ -32,7 +32,7 @@ const app = express();
 // ============================================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
 // ============================================================
@@ -516,6 +516,150 @@ app.get('/api/dashboard/stats', authenticate, requireOnboarding, async (req, res
   } catch (err) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
+});
+
+// ============================================================
+// MIDDLEWARE ADMIN
+// ============================================================
+const requireAdmin = async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT is_admin FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!rows[0]?.is_admin) {
+      return res.status(403).json({ error: 'Accès admin requis' });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// ROUTES ADMIN
+// ============================================================
+
+// GET /api/admin/stats — stats globales plateforme
+app.get('/api/admin/stats', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const [companies, users, activeToday] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM companies WHERE is_active = TRUE'),
+      pool.query('SELECT COUNT(*) FROM users WHERE is_active = TRUE'),
+      pool.query(`SELECT COUNT(DISTINCT company_id) FROM users WHERE last_login >= NOW() - INTERVAL '24 hours'`),
+    ]);
+    return res.json({
+      total_companies: parseInt(companies.rows[0].count),
+      total_users:     parseInt(users.rows[0].count),
+      active_today:    parseInt(activeToday.rows[0].count),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/admin/companies — liste toutes les companies
+app.get('/api/admin/companies', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT c.id, c.name, c.email, c.phone, c.slug, c.is_active, c.plan,
+             c.onboarding_done, c.created_at,
+             COUNT(DISTINCT u.id) AS user_count,
+             MAX(u.last_login) AS last_login
+      FROM companies c
+      LEFT JOIN users u ON u.company_id = c.id
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+    `);
+    return res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/admin/company/:id — détails d'une company
+app.get('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [company, users, clients, devis, factures] = await Promise.all([
+      pool.query('SELECT * FROM companies WHERE id = $1', [id]),
+      pool.query('SELECT id, email, role, is_active, last_login, created_at FROM users WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*) FROM clients WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*) FROM quotes WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*), COALESCE(SUM(total),0) AS total FROM invoices WHERE company_id = $1', [id]),
+    ]);
+    if (!company.rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
+    return res.json({
+      company:  company.rows[0],
+      users:    users.rows,
+      stats: {
+        clients:  parseInt(clients.rows[0].count),
+        devis:    parseInt(devis.rows[0].count),
+        factures: parseInt(factures.rows[0].count),
+        ca_total: parseFloat(factures.rows[0].total),
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PUT /api/admin/company/:id — modifier une company
+app.put('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, email, phone, is_active, plan } = req.body;
+    await pool.query(
+      `UPDATE companies SET name=$1, email=$2, phone=$3, is_active=$4, plan=$5, updated_at=NOW()
+       WHERE id = $6`,
+      [name, email, phone, is_active, plan, id]
+    );
+    return res.json({ message: 'Entreprise mise à jour' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// PUT /api/admin/company/:id/toggle — activer/suspendre
+app.put('/api/admin/company/:id/toggle', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      `UPDATE companies SET is_active = NOT is_active, updated_at=NOW()
+       WHERE id = $1 RETURNING is_active, name`,
+      [id]
+    );
+    return res.json({
+      message: rows[0].is_active ? `${rows[0].name} activée` : `${rows[0].name} suspendue`,
+      is_active: rows[0].is_active
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// DELETE /api/admin/company/:id — supprimer une company et toutes ses données
+app.delete('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    // La suppression en cascade est gérée par les FK ON DELETE CASCADE
+    const { rows } = await pool.query('DELETE FROM companies WHERE id = $1 RETURNING name', [id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
+    return res.json({ message: `Entreprise "${rows[0].name}" supprimée définitivement` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/admin/me — vérifier si l'utilisateur connecté est admin
+app.get('/api/admin/me', authenticate, requireAdmin, async (req, res) => {
+  return res.json({ is_admin: true, email: req.user.email });
 });
 
 // ============================================================
