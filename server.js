@@ -332,22 +332,17 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 // GET /api/auth/me
-app.get('/api/auth/me', authenticate, async (req, res) => {
+app.get('/api/health', async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT u.id, u.email, u.first_name, u.last_name, u.role, u.company_id,
-              c.name AS company_name, c.onboarding_done, c.logo_url,
-              c.address, c.phone, c.email AS company_email, c.siret,
-              c.default_hourly_rate, c.currency
-       FROM users u
-       JOIN companies c ON c.id = u.company_id
-       WHERE u.id = $1`,
-      [req.user.id]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: 'Utilisateur non trouvé' });
-    return res.json(result.rows[0]);
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'connected', time: new Date().toISOString() });
   } catch (err) {
-    res.status(500).json({ error: 'Erreur serveur' });
+    res.status(503).json({ 
+      status: 'error', 
+      db: 'disconnected',
+      message: err.message,
+      code: err.code
+    });
   }
 });
 
