@@ -41,11 +41,11 @@ const pool = new Pool({
 app.use(express.json());
 app.use(cors({
   origin: [
-    process.env.FRONTEND_URL,
-    'http://localhost:3000',
     'http://localhost:5173',
+    'http://localhost:3000',
+    'https://weldor-soudure-mv09.netlify.app'
   ],
-  credentials: true,
+  credentials: true
 }));
 
 // Rate limiting sur les routes d'auth
