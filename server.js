@@ -1,5 +1,6 @@
 // ============================================================
 // WELDOR SAAS - BACKEND NODE.JS / EXPRESS
+// Fichier: server.js
 // ============================================================
 require('dotenv').config();
 const express     = require('express');
@@ -13,21 +14,20 @@ const crypto      = require('crypto');
 
 const app = express();
 
-// ============================================================
-// CONFIGURATION DB
-// ============================================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// ============================================================
-// MIDDLEWARES
-// ============================================================
 app.use(express.json());
+
+// ============================================================
+// CORS — CORRECTION PRINCIPALE
+// Utilise une fonction au lieu d'un tableau pour gérer
+// correctement les requêtes preflight OPTIONS
+// ============================================================
 app.use(cors({
   origin: function(origin, callback) {
-    // Autoriser les requêtes sans origin (Postman, curl) et toutes les origines autorisées
     const allowed = [
       'http://localhost:5173',
       'http://localhost:3000',
@@ -40,23 +40,19 @@ app.use(cors({
     }
   },
   credentials: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // Répondre aux preflight OPTIONS sur toutes les routes
 app.options('*', cors());
 
-// Rate limiting sur les routes d'auth
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Trop de tentatives. Réessayez dans 15 minutes.' },
 });
 
-// ============================================================
-// HELPERS JWT
-// ============================================================
 const generateAccessToken = (user) =>
   jwt.sign(
     { id: user.id, company_id: user.company_id, role: user.role, email: user.email },
@@ -66,9 +62,6 @@ const generateAccessToken = (user) =>
 
 const generateRefreshToken = () => crypto.randomBytes(64).toString('hex');
 
-// ============================================================
-// MIDDLEWARE AUTH
-// ============================================================
 const authenticate = async (req, res, next) => {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer '))
@@ -86,19 +79,14 @@ const authenticate = async (req, res, next) => {
 const requireOnboarding = async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      'SELECT onboarding_done FROM companies WHERE id = $1',
-      [req.user.company_id]
+      'SELECT onboarding_done FROM companies WHERE id = $1', [req.user.company_id]
     );
-    if (!rows[0]?.onboarding_done) {
+    if (!rows[0]?.onboarding_done)
       return res.status(403).json({ error: 'Onboarding requis', code: 'ONBOARDING_REQUIRED' });
-    }
     next();
   } catch (err) { next(err); }
 };
 
-// ============================================================
-// VALIDATION SCHEMAS
-// ============================================================
 const registerSchema = Joi.object({
   company_name: Joi.string().min(2).max(255).required(),
   email:        Joi.string().email().required(),
@@ -113,45 +101,35 @@ const loginSchema = Joi.object({
 });
 
 const onboardingSchema = Joi.object({
-  name:                Joi.string().min(2).max(255).required(),
-  email:               Joi.string().email().allow('', null),
-  phone:               Joi.string().allow('', null),
-  address:             Joi.string().allow('', null),
-  siret:               Joi.string().allow('', null),
-  tva_number:          Joi.string().allow('', null),
+  name:               Joi.string().min(2).max(255).required(),
+  email:              Joi.string().email().allow('', null),
+  phone:              Joi.string().allow('', null),
+  address:            Joi.string().allow('', null),
+  siret:              Joi.string().allow('', null),
+  tva_number:         Joi.string().allow('', null),
   default_hourly_rate: Joi.number().min(0).default(0),
-  currency:            Joi.string().default('EUR'),
+  currency:           Joi.string().default('EUR'),
 });
 
-// ============================================================
-// ROUTES AUTH
-// ============================================================
-
-// POST /api/auth/register
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { error, value } = registerSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.details[0].message });
     const { company_name, email, password } = value;
-
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
     if (existing.rows.length > 0)
       return res.status(409).json({ error: 'Cet email est déjà utilisé' });
-
     let slug = company_name.toLowerCase()
       .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
       .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-
     const slugCheck = await pool.query('SELECT id FROM companies WHERE slug LIKE $1', [`${slug}%`]);
     if (slugCheck.rows.length > 0) slug = `${slug}-${Date.now()}`;
-
     const password_hash = await bcrypt.hash(password, 12);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const companyRes = await client.query(
-        `INSERT INTO companies (name, slug) VALUES ($1, $2) RETURNING id`,
-        [company_name, slug]
+        `INSERT INTO companies (name, slug) VALUES ($1, $2) RETURNING id`, [company_name, slug]
       );
       const company_id = companyRes.rows[0].id;
       const userRes = await client.query(
@@ -161,7 +139,6 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       );
       const user = userRes.rows[0];
       await client.query('COMMIT');
-
       const accessToken  = generateAccessToken(user);
       const refreshToken = generateRefreshToken();
       const expiresAt    = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -184,29 +161,23 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 });
 
-// POST /api/auth/login
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { error, value } = loginSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.details[0].message });
     const { email, password } = value;
-
     const result = await pool.query(
       `SELECT u.id, u.email, u.password_hash, u.role, u.is_active,
               u.company_id, c.name AS company_name, c.onboarding_done
-       FROM users u JOIN companies c ON c.id = u.company_id
-       WHERE u.email = $1`,
+       FROM users u JOIN companies c ON c.id = u.company_id WHERE u.email = $1`,
       [email.toLowerCase()]
     );
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
     if (!user.is_active) return res.status(403).json({ error: 'Compte désactivé' });
-
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-
     const accessToken  = generateAccessToken(user);
     const refreshToken = generateRefreshToken();
     const expiresAt    = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -226,21 +197,19 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// POST /api/auth/refresh
 app.post('/api/auth/refresh', async (req, res) => {
   const { refresh_token } = req.body;
   if (!refresh_token) return res.status(400).json({ error: 'Refresh token manquant' });
   try {
     const result = await pool.query(
       `SELECT rt.user_id, rt.expires_at, u.email, u.role, u.company_id, u.is_active
-       FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id
-       WHERE rt.token = $1`, [refresh_token]
+       FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id WHERE rt.token = $1`,
+      [refresh_token]
     );
     const row = result.rows[0];
     if (!row) return res.status(401).json({ error: 'Refresh token invalide' });
     if (new Date(row.expires_at) < new Date()) return res.status(401).json({ error: 'Refresh token expiré' });
     if (!row.is_active) return res.status(403).json({ error: 'Compte désactivé' });
-
     await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refresh_token]);
     const newAccessToken  = generateAccessToken(row);
     const newRefreshToken = generateRefreshToken();
@@ -256,14 +225,12 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
-// POST /api/auth/logout
 app.post('/api/auth/logout', async (req, res) => {
   const { refresh_token } = req.body;
   if (refresh_token) await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refresh_token]);
   return res.json({ message: 'Déconnecté' });
 });
 
-// GET /api/auth/me
 app.get('/api/auth/me', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -279,9 +246,6 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// ============================================================
-// ONBOARDING
-// ============================================================
 app.put('/api/company/onboarding', authenticate, async (req, res) => {
   try {
     const { error, value } = onboardingSchema.validate(req.body);
@@ -301,7 +265,6 @@ app.put('/api/company/onboarding', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/company/settings
 app.get('/api/company/settings', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -313,7 +276,6 @@ app.get('/api/company/settings', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// PUT /api/company/settings
 app.put('/api/company/settings', authenticate, async (req, res) => {
   try {
     const { name, email, phone, address, siret, tva_number, default_hourly_rate, currency } = req.body;
@@ -326,9 +288,27 @@ app.put('/api/company/settings', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// ============================================================
-// ROUTES CLIENTS
-// ============================================================
+app.get('/api/welders', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM welders WHERE company_id = $1 ORDER BY last_name, first_name`, [req.user.company_id]
+    );
+    return res.json(rows);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.post('/api/welders', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { first_name, last_name, email, phone, position, hourly_rate } = req.body;
+    const { rows } = await pool.query(
+      `INSERT INTO welders (company_id, first_name, last_name, email, phone, position, hourly_rate)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.user.company_id, first_name, last_name, email, phone, position, hourly_rate]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
 app.get('/api/clients', authenticate, requireOnboarding, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -338,30 +318,85 @@ app.get('/api/clients', authenticate, requireOnboarding, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// ============================================================
-// DASHBOARD STATS
-// ============================================================
+app.post('/api/clients', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { name, email, phone, address, siret, notes } = req.body;
+    const { rows } = await pool.query(
+      `INSERT INTO clients (company_id, name, email, phone, address, siret, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [req.user.company_id, name, email, phone, address, siret, notes]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.put('/api/clients/:id', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { name, email, phone, address, siret, notes } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE clients SET name=$1, email=$2, phone=$3, address=$4, siret=$5, notes=$6
+       WHERE id=$7 AND company_id=$8 RETURNING *`,
+      [name, email, phone, address, siret, notes, req.params.id, req.user.company_id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Client non trouvé' });
+    return res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.delete('/api/clients/:id', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM clients WHERE id=$1 AND company_id=$2',
+      [req.params.id, req.user.company_id]);
+    return res.json({ message: 'Client supprimé' });
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.get('/api/projects', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = `SELECT p.*, c.name AS client_name FROM projects p
+                 LEFT JOIN clients c ON c.id = p.client_id WHERE p.company_id = $1`;
+    const params = [req.user.company_id];
+    if (status) { query += ` AND p.status = $2`; params.push(status); }
+    query += ` ORDER BY p.created_at DESC`;
+    const { rows } = await pool.query(query, params);
+    return res.json(rows);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.post('/api/projects', authenticate, requireOnboarding, async (req, res) => {
+  try {
+    const { client_id, name, description, status, start_date, end_date, budget } = req.body;
+    const { rows } = await pool.query(
+      `INSERT INTO projects (company_id, client_id, name, description, status, start_date, end_date, budget)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.company_id, client_id, name, description, status, start_date, end_date, budget]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
 app.get('/api/dashboard/stats', authenticate, requireOnboarding, async (req, res) => {
   try {
     const cid = req.user.company_id;
-    const [projects, invoices] = await Promise.all([
+    const [welders, projects, timesheets, invoices] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM welders WHERE company_id=$1 AND is_active=TRUE', [cid]),
       pool.query("SELECT COUNT(*) FROM projects WHERE company_id=$1 AND status='in_progress'", [cid]),
-      pool.query(
-        `SELECT COALESCE(SUM(total),0) AS revenue FROM invoices
-         WHERE company_id=$1 AND status='paid' AND EXTRACT(YEAR FROM issue_date)=EXTRACT(YEAR FROM NOW())`,
-        [cid]
-      ),
+      pool.query(`SELECT COALESCE(SUM(hours_worked),0) AS total FROM timesheets
+                  WHERE company_id=$1 AND work_date >= date_trunc('month', NOW())`, [cid]),
+      pool.query(`SELECT COALESCE(SUM(total),0) AS revenue FROM invoices
+                  WHERE company_id=$1 AND status='paid'
+                  AND EXTRACT(YEAR FROM issue_date)=EXTRACT(YEAR FROM NOW())`, [cid]),
     ]);
     return res.json({
+      active_welders:    parseInt(welders.rows[0].count),
       active_projects:   parseInt(projects.rows[0].count),
+      hours_this_month:  parseFloat(timesheets.rows[0].total),
       revenue_this_year: parseFloat(invoices.rows[0].revenue),
     });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-// ============================================================
-// MIDDLEWARE ADMIN
-// ============================================================
 const requireAdmin = async (req, res, next) => {
   try {
     const { rows } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
@@ -370,9 +405,6 @@ const requireAdmin = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// ============================================================
-// ROUTES ADMIN
-// ============================================================
 app.get('/api/admin/stats', authenticate, requireAdmin, async (req, res) => {
   try {
     const [companies, users, activeToday] = await Promise.all([
@@ -401,13 +433,56 @@ app.get('/api/admin/companies', authenticate, requireAdmin, async (req, res) => 
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
+app.get('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [company, users, clients, devis, factures] = await Promise.all([
+      pool.query('SELECT * FROM companies WHERE id = $1', [id]),
+      pool.query('SELECT id, email, role, is_active, last_login, created_at FROM users WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*) FROM clients WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*) FROM quotes WHERE company_id = $1', [id]),
+      pool.query('SELECT COUNT(*), COALESCE(SUM(total),0) AS total FROM invoices WHERE company_id = $1', [id]),
+    ]);
+    if (!company.rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
+    return res.json({
+      company: company.rows[0], users: users.rows,
+      stats: {
+        clients: parseInt(clients.rows[0].count), devis: parseInt(devis.rows[0].count),
+        factures: parseInt(factures.rows[0].count), ca_total: parseFloat(factures.rows[0].total),
+      }
+    });
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.put('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { name, email, phone, is_active, plan } = req.body;
+    await pool.query(
+      `UPDATE companies SET name=$1, email=$2, phone=$3, is_active=$4, plan=$5, updated_at=NOW() WHERE id=$6`,
+      [name, email, phone, is_active, plan, req.params.id]
+    );
+    return res.json({ message: 'Entreprise mise à jour' });
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
 app.put('/api/admin/company/:id/toggle', authenticate, requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE companies SET is_active = NOT is_active, updated_at=NOW()
        WHERE id = $1 RETURNING is_active, name`, [req.params.id]
     );
-    return res.json({ message: rows[0].is_active ? `${rows[0].name} activée` : `${rows[0].name} suspendue`, is_active: rows[0].is_active });
+    return res.json({
+      message: rows[0].is_active ? `${rows[0].name} activée` : `${rows[0].name} suspendue`,
+      is_active: rows[0].is_active
+    });
+  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+app.delete('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('DELETE FROM companies WHERE id = $1 RETURNING name', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
+    return res.json({ message: `Entreprise "${rows[0].name}" supprimée définitivement` });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -415,9 +490,6 @@ app.get('/api/admin/me', authenticate, requireAdmin, async (req, res) => {
   return res.json({ is_admin: true, email: req.user.email });
 });
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -429,9 +501,6 @@ app.get('/api/health', async (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'Weldor API running' }));
 
-// ============================================================
-// GESTION ERREURS
-// ============================================================
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Erreur interne du serveur' });
