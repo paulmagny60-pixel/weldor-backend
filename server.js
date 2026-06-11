@@ -508,12 +508,12 @@ app.get('/api/dashboard/stats', authenticate, requireOnboarding, async (req, res
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
+// Emails admin — codés en dur, accès total garanti
+const ADMIN_EMAILS = ['paul.magny60@gmail.com'];
+
 const requireAdmin = async (req, res, next) => {
-  try {
-    const { rows } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
-    if (!rows[0]?.is_admin) return res.status(403).json({ error: 'Accès admin requis' });
-    next();
-  } catch (err) { next(err); }
+  if (ADMIN_EMAILS.includes(req.user.email)) return next();
+  return res.status(403).json({ error: 'Accès admin requis' });
 };
 
 app.get('/api/admin/stats', authenticate, requireAdmin, async (req, res) => {
