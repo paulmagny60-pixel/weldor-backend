@@ -1,6 +1,5 @@
 // ============================================================
 // WELDOR SAAS - BACKEND NODE.JS / EXPRESS
-// Fichier: server.js
 // ============================================================
 require('dotenv').config();
 const express     = require('express');
@@ -21,11 +20,6 @@ const pool = new Pool({
 
 app.use(express.json());
 
-// ============================================================
-// CORS — CORRECTION PRINCIPALE
-// Utilise une fonction au lieu d'un tableau pour gérer
-// correctement les requêtes preflight OPTIONS
-// ============================================================
 app.use(cors({
   origin: function(origin, callback) {
     const allowed = [
@@ -44,7 +38,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// Répondre aux preflight OPTIONS sur toutes les routes
 app.options('*', cors());
 
 const authLimiter = rateLimit({
@@ -111,6 +104,136 @@ const onboardingSchema = Joi.object({
   currency:           Joi.string().default('EUR'),
 });
 
+// ============================================================
+// AUTO-CRÉATION DES TABLES AU DÉMARRAGE
+// ============================================================
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    console.log('🔧 Vérification et création des tables...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS companies (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        address TEXT,
+        siret VARCHAR(50),
+        tva_number VARCHAR(50),
+        default_hourly_rate NUMERIC(10,2) DEFAULT 0,
+        currency VARCHAR(10) DEFAULT 'EUR',
+        logo_url TEXT,
+        onboarding_done BOOLEAN DEFAULT FALSE,
+        is_active BOOLEAN DEFAULT TRUE,
+        plan VARCHAR(50) DEFAULT 'free',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        role VARCHAR(50) DEFAULT 'owner',
+        is_active BOOLEAN DEFAULT TRUE,
+        is_admin BOOLEAN DEFAULT FALSE,
+        last_login TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        token VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS clients (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        address TEXT,
+        siret VARCHAR(50),
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS projects (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        status VARCHAR(50) DEFAULT 'draft',
+        start_date DATE,
+        end_date DATE,
+        budget NUMERIC(12,2),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS welders (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        position VARCHAR(100),
+        hourly_rate NUMERIC(10,2),
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS timesheets (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        welder_id INTEGER REFERENCES welders(id) ON DELETE CASCADE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        work_date DATE NOT NULL,
+        hours_worked NUMERIC(5,2) NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS quotes (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+        title VARCHAR(255),
+        total NUMERIC(12,2),
+        status VARCHAR(50) DEFAULT 'draft',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS invoices (
+        id SERIAL PRIMARY KEY,
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+        quote_id INTEGER REFERENCES quotes(id) ON DELETE SET NULL,
+        total NUMERIC(12,2),
+        status VARCHAR(50) DEFAULT 'draft',
+        issue_date DATE DEFAULT CURRENT_DATE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log('✅ Tables vérifiées/créées avec succès');
+  } catch (err) {
+    console.error('❌ Erreur init DB:', err.message);
+  } finally {
+    client.release();
+  }
+}
+
+// ============================================================
+// ROUTES AUTH
+// ============================================================
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { error, value } = registerSchema.validate(req.body);
@@ -364,18 +487,6 @@ app.get('/api/projects', authenticate, requireOnboarding, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-app.post('/api/projects', authenticate, requireOnboarding, async (req, res) => {
-  try {
-    const { client_id, name, description, status, start_date, end_date, budget } = req.body;
-    const { rows } = await pool.query(
-      `INSERT INTO projects (company_id, client_id, name, description, status, start_date, end_date, budget)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.user.company_id, client_id, name, description, status, start_date, end_date, budget]
-    );
-    return res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
-});
-
 app.get('/api/dashboard/stats', authenticate, requireOnboarding, async (req, res) => {
   try {
     const cid = req.user.company_id;
@@ -433,38 +544,6 @@ app.get('/api/admin/companies', authenticate, requireAdmin, async (req, res) => 
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
-app.get('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const [company, users, clients, devis, factures] = await Promise.all([
-      pool.query('SELECT * FROM companies WHERE id = $1', [id]),
-      pool.query('SELECT id, email, role, is_active, last_login, created_at FROM users WHERE company_id = $1', [id]),
-      pool.query('SELECT COUNT(*) FROM clients WHERE company_id = $1', [id]),
-      pool.query('SELECT COUNT(*) FROM quotes WHERE company_id = $1', [id]),
-      pool.query('SELECT COUNT(*), COALESCE(SUM(total),0) AS total FROM invoices WHERE company_id = $1', [id]),
-    ]);
-    if (!company.rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
-    return res.json({
-      company: company.rows[0], users: users.rows,
-      stats: {
-        clients: parseInt(clients.rows[0].count), devis: parseInt(devis.rows[0].count),
-        factures: parseInt(factures.rows[0].count), ca_total: parseFloat(factures.rows[0].total),
-      }
-    });
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
-});
-
-app.put('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
-  try {
-    const { name, email, phone, is_active, plan } = req.body;
-    await pool.query(
-      `UPDATE companies SET name=$1, email=$2, phone=$3, is_active=$4, plan=$5, updated_at=NOW() WHERE id=$6`,
-      [name, email, phone, is_active, plan, req.params.id]
-    );
-    return res.json({ message: 'Entreprise mise à jour' });
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
-});
-
 app.put('/api/admin/company/:id/toggle', authenticate, requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -475,14 +554,6 @@ app.put('/api/admin/company/:id/toggle', authenticate, requireAdmin, async (req,
       message: rows[0].is_active ? `${rows[0].name} activée` : `${rows[0].name} suspendue`,
       is_active: rows[0].is_active
     });
-  } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
-});
-
-app.delete('/api/admin/company/:id', authenticate, requireAdmin, async (req, res) => {
-  try {
-    const { rows } = await pool.query('DELETE FROM companies WHERE id = $1 RETURNING name', [req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Entreprise non trouvée' });
-    return res.json({ message: `Entreprise "${rows[0].name}" supprimée définitivement` });
   } catch (err) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 
@@ -507,6 +578,13 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`✅ Weldor API démarré sur le port ${PORT}`));
+
+// Démarrer le serveur APRÈS avoir initialisé la base
+initDatabase().then(() => {
+  app.listen(PORT, () => console.log(`✅ Weldor API démarré sur le port ${PORT}`));
+}).catch(err => {
+  console.error('❌ Impossible de démarrer:', err);
+  process.exit(1);
+});
 
 module.exports = app;
