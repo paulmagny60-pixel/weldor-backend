@@ -13,6 +13,9 @@ const crypto      = require('crypto');
 
 const app = express();
 
+// Render est derrière un reverse proxy : nécessaire pour express-rate-limit
+app.set('trust proxy', 1);
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
